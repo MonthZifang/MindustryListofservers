@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Mindustry 服务器状态监控</title>
+    <style>
+        :root {
+            --primary-color: #2c3e50;
+            --secondary-color: #3498db;
+            --online-color: #2ecc71;
+            --offline-color: #e74c3c;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 2rem;
+            background-color: #f5f6fa;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 2rem;
+            border-radius: 10px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            color: var(--primary-color);
+            text-align: center;
+            margin-bottom: 2rem;
+        }
+
+        .controls {
+            display: flex;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+        }
+
+        button {
+            padding: 0.8rem 1.5rem;
+            border: none;
+            border-radius: 5px;
+            background-color: var(--secondary-color);
+            color: white;
+            cursor: pointer;
+            transition: transform 0.2s;
+        }
+
+        button:hover {
+            transform: translateY(-2px);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 1rem;
+        }
+
+        th {
+            background-color: var(--primary-color);
+            color: white;
+            padding: 1rem;
+            text-align: left;
+        }
+
+        td {
+            padding: 1rem;
+            border-bottom: 1px solid #ecf0f1;
+        }
+
+        tr:hover {
+            background-color: #f8f9fa;
+        }
+
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 0.5rem;
+        }
+
+        .online .status-indicator {
+            background-color: var(--online-color);
+        }
+
+        .offline .status-indicator {
+            background-color: var(--offline-color);
+        }
+
+        .loading {
+            display: none;
+            text-align: center;
+            padding: 1rem;
+            color: var(--secondary-color);
+        }
+
+        .loading::after {
+            content: " ";
+            display: inline-block;
+            width: 1rem;
+            height: 1rem;
+            border: 3px solid rgba(0,0,0,.1);
+            border-radius: 50%;
+            border-top-color: var(--secondary-color);
+            animation: spin 1s ease-in-out infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .error {
+            color: var(--offline-color);
+            padding: 1rem;
+            text-align: center;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>📡 Mindustry 全球服务器状态</h1>
+        
+        <div class="controls">
+            <button onclick="loadServerList()">🔄 手动刷新</button>
+            <div class="loading" id="loading">加载中</div>
+            <div class="error" id="error"></div>
+        </div>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>服务器名称</th>
+                    <th>地址</th>
+                    <th>状态</th>
+                    <th>玩家</th>
+                    <th>版本</th>
+                    <th>模式</th>
+                </tr>
+            </thead>
+            <tbody id="serverData">
+                <!-- 数据将通过JavaScript填充 -->
+            </tbody>
+        </table>
+    </div>
+
+    <script>
+        let serverList = [];
+
+        async function fetchServerList() {
+            try {
+                showLoading();
+                const response = await fetch('https://raw.githubusercontent.com/Anuken/Mindustry/master/servers_v7.json');
+                const data = await response.json();
+                serverList = data;
+                await updateServerStatus();
+            } catch (error) {
+                showError('无法加载服务器列表: ' + error.message);
+            } finally {
+                hideLoading();
+            }
+        }
+
+        async function updateServerStatus() {
+            const tbody = document.getElementById('serverData');
+            tbody.innerHTML = '';
+
+            const requests = serverList.flatMap(server => 
+                server.address.map(async addr => {
+                    const [ip, port] = addr.split(':');
+                    const status = await checkServerStatus({ ip, port });
+                    return { ...server, addr, status };
+                })
+            );
+
+            const results = await Promise.all(requests);
+            
+            results.forEach(result => {
+                const row = document.createElement('tr');
+                row.className = result.status.status;
+                row.innerHTML = `
+                    <td>${result.name}</td>
+                    <td>${result.addr}</td>
+                    <td>
+                        <span class="status-indicator"></span>
+                        ${result.status.status === 'online' ? '在线' : '离线'}
+                    </td>
+                    <td>${result.status.players || '-'}</td>
+                    <td>${result.status.version || '-'}</td>
+                    <td>${result.status.mode || '-'}</td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
+
+        async function checkServerStatus(server) {
+            try {
+                const controller = new AbortController();
+                const timeoutId = setTimeout(() => controller.abort(), 5000);
+
+                const response = await fetch(`https://corsproxy.io/?${encodeURIComponent(`http://${server.ip}:${server.port}/status`)}`, {
+                    signal: controller.signal
+                });
+                
+                clearTimeout(timeoutId);
+                
+                if (!response.ok) throw new Error('服务器无响应');
+                
+                const data = await response.json();
+                return {
+                    status: 'online',
+                    players: `${data.players}/${data.playerLimit}`,
+                    version: data.version,
+                    mode: data.mode
+                };
+            } catch (error) {
+                return { status: 'offline' };
+            }
+        }
+
+        function showLoading() {
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('error').style.display = 'none';
+        }
+
+        function hideLoading() {
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        function showError(message) {
+            const errorDiv = document.getElementById('error');
+            errorDiv.style.display = 'block';
+            errorDiv.textContent = message;
+        }
+
+        // 公开给按钮调用的函数
+        function loadServerList() {
+            fetchServerList();
+        }
+
+        // 页面加载时自动获取
+        loadServerList();
+    </script>
+</body>
+</html>
