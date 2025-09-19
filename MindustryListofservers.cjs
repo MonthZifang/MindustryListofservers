@@ -1,343 +1,383 @@
-const dgram = require('dgram');
-const fsPromises = require('fs/promises');
+
+// ---------------------- 依赖检查 ----------------------
+const { spawnSync } = require('child_process');
+
+
+function ensureDependency(moduleName) {
+  try {
+    require.resolve(moduleName);
+    return true;
+  } catch {
+    console.log(`检测到缺少依赖模块 "${moduleName}"，尝试自动安装...`);
+    const result = spawnSync('npm', ['install', moduleName], {
+      stdio: 'inherit',
+      shell: true
+    });
+    if (result.status !== 0) {
+      console.error(`自动安装 "${moduleName}" 失败，请手动执行: npm install ${moduleName}`);
+      process.exit(1);
+    } else {
+      console.log(`模块 "${moduleName}" 安装成功。`);
+      return true;
+    }
+  }
+}
+// 检查并安装关键依赖
+ensureDependency('ping');
+
+
+const https = require('https');
 const fs = require('fs');
+const dgram = require('dgram');
 const path = require('path');
+const ping = require('ping');
 const { Buffer } = require('buffer');
 
-// ---------------------- 配置常量 ----------------------
-const CLIENT_PORT = 65415; // 客户端绑定端口（抓包显示的源端口）
-const REQUEST_DATA = Buffer.from([0xFE, 0x01]); // Mindustry 请求包数据
-const SERVERS_FILE = path.join(__dirname, 'servers_v7.json'); // 服务器配置文件（新格式）
-const RAW_FILE = path.join(__dirname, 'output.json');      // 存放未解析的原始元数据
-const PARSED_FILE = path.join(__dirname, 'responses.json');  // 存放解析后的数据
-const NO_RESPONSE_FILE = path.join(__dirname, 'serveip.json'); // 存放无响应服务器列表
-const UDP_TIMEOUT = 30000; // UDP 收包等待时间（30秒）
+// ---------------------- 配置 ----------------------
+const SERVER_LIST_URLS = [
+  'https://raw.githubusercontent.com/Anuken/Mindustry/master/servers_v7.json',
+  'https://cdn.staticaly.com/gh/Anuken/Mindustry/master/servers_v7.json',
+  'https://github.moeyy.xyz/https://github.com/Anuken/Mindustry/blob/master/servers_v7.json'
+];
 
-// 增强数据处理相关配置
+const SERVER_LIST_PATH = path.join(__dirname, 'servers_v7.json');
+const RAW_FILE = path.join(__dirname, 'raw_responses.json');
+const PARSED_FILE = path.join(__dirname, 'servers.json');
+const CLIENT_PORT = 65415;
+const REQUEST_DATA = Buffer.from([0xFE, 0x01]);
+const UDP_TIMEOUT = 30000;
+
 const config = {
-  defaultPort: 6567,             // 默认端口
-  colorTagRegex: /\[#?(\w+)\]/g,
+  defaultPort: 6567,
+  colorTagRegex: /\[([a-z0-9#]+)\]/g,
   nameDescSeparator: '|',
   dateLocale: 'zh-CN'
 };
 
-// ---------------------- 服务器配置加载 ----------------------
-/**
- * servers_v7.json 格式示例：
- * [
- *   {
- *     "name": "EscoCorp",
- *     "address": [
- *       "121.127.37.17:6567",
- *       "121.127.37.17:6568",
- *       "121.127.37.17"        // 未指定端口时默认使用 6567
- *     ]
- *   },
- *   { ... }
- * ]
- */
+
+// ---------------------- 下载服务器列表 ----------------------
+async function downloadServerList() {
+  const MAX_RETRIES = 3;
+  const RETRY_DELAY = 5000;
+
+  for (let urlIndex = 0; urlIndex < SERVER_LIST_URLS.length; urlIndex++) {
+    const url = SERVER_LIST_URLS[urlIndex];
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
+        console.log(`尝试从源 ${urlIndex + 1} 下载（尝试 ${attempt}/${MAX_RETRIES}）...`);
+        const data = await new Promise((resolve, reject) => {
+          https.get(url, (res) => {
+            if (res.statusCode !== 200) {
+              reject(new Error(`状态码 ${res.statusCode}`));
+              res.resume();
+              return;
+            }
+
+            let data = '';
+            res.setEncoding('utf8');
+            res.on('data', chunk => data += chunk);
+            res.on('end', () => {
+              fs.writeFile(SERVER_LIST_PATH, data, (err) => {
+                if (err) reject(err);
+                else resolve(data);
+              });
+            });
+          }).on('error', reject);
+        });
+
+        console.log(`从源 ${urlIndex + 1} 下载成功`);
+        return data;
+
+      } catch (err) {
+        console.error(`下载源 ${urlIndex + 1} 尝试 ${attempt}/${MAX_RETRIES} 失败: ${err.message}`);
+        if (attempt < MAX_RETRIES) {
+          await new Promise(res => setTimeout(res, RETRY_DELAY));
+        }
+      }
+    }
+  }
+
+  throw new Error('所有下载源都失败');
+}
+
+// ---------------------- 加载服务器地址 ----------------------
 async function loadServers() {
   try {
-    const data = await fsPromises.readFile(SERVERS_FILE, 'utf8');
+    const data = await fs.promises.readFile(SERVER_LIST_PATH, 'utf8');
     const serverGroups = JSON.parse(data);
-    if (!Array.isArray(serverGroups)) {
-      throw new Error('服务器配置格式错误，应为数组');
-    }
+
+    if (!Array.isArray(serverGroups)) throw new Error('服务器配置格式错误');
+
     const servers = [];
-    // 遍历每个服务器组，每个组可能包含多个地址
     serverGroups.forEach(group => {
       if (Array.isArray(group.address)) {
         group.address.forEach(addr => {
-          let ip, port;
-          if (addr.includes(':')) {
-            [ip, port] = addr.split(':');
-            port = parseInt(port);
-          } else {
-            ip = addr;
-            port = config.defaultPort;
-          }
-          servers.push({ ip, port, name: group.name });
+          let [host, port] = addr.includes(':') ? addr.split(':') : [addr, config.defaultPort];
+          servers.push({ host, port: parseInt(port), name: group.name });
         });
       }
     });
     return servers;
   } catch (err) {
-    console.error('读取服务器配置失败:', err);
-    throw err;
+    console.error('读取服务器配置失败:', err.message);
+    return [];
   }
 }
 
-// ---------------------- UDP 请求与响应收集 ----------------------
-async function sendUDPRequests() {
+// ---------------------- 发送UDP请求，保留域名作为key ----------------------
+async function sendUDPRequests(servers) {
   return new Promise((resolve) => {
     const responses = {};
     const socket = dgram.createSocket('udp4');
 
-    socket.bind(CLIENT_PORT, async () => {
+    socket.bind(CLIENT_PORT, () => {
       console.log(`UDP客户端已绑定端口 ${CLIENT_PORT}`);
-      try {
-        const servers = await loadServers();
-        servers.forEach(server => {
-          const key = `${server.ip}:${server.port}`;
-          socket.send(REQUEST_DATA, server.port, server.ip, (err) => {
-            if (err) {
-              console.error(`发送到 ${key} 失败: ${err.message}`);
-            } else {
-              console.log(`已发送请求到 ${key}`);
-            }
-          });
+
+      if (servers.length === 0) {
+        console.log('没有可用的服务器进行探测');
+        socket.close();
+        resolve(responses);
+        return;
+      }
+
+      // 发送请求并记录映射
+      const hostPortMap = {};
+
+      servers.forEach(server => {
+        const key = `${server.host}:${server.port}`;
+        hostPortMap[`${server.host}:${server.port}`] = key; // 域名或 IP 保留
+        socket.send(REQUEST_DATA, server.port, server.host, (err) => {
+          if (err) console.error(`发送到 ${key} 失败: ${err.message}`);
+          else console.log(`已发送请求到 ${key}`);
         });
-      } catch (err) {
-        console.error('加载服务器配置失败:', err);
-      }
-    });
+      });
 
-    socket.on('message', (msg, rinfo) => {
-      const key = `${rinfo.address}:${rinfo.port}`;
-      const hexData = msg.toString('hex'); // 以 16 进制格式保存
-      console.log(`收到来自 ${key} 的响应`);
-      // 如果同一服务器（key）多次响应，则以数组形式存储
-      if (!responses[key]) {
-        responses[key] = [];
-      }
-      responses[key].push({ timestamp: Date.now(), response: hexData });
-    });
+      socket.on('message', (msg, rinfo) => {
+        const ipKey = `${rinfo.address}:${rinfo.port}`;
+        const matchedKey = Object.keys(hostPortMap).find(k => k.endsWith(`:${rinfo.port}`)) || ipKey;
 
-    socket.on('error', (err) => {
-      console.error(`Socket错误: ${err.message}`);
-    });
+        const hexData = msg.toString('hex');
+        console.log(`收到来自 ${matchedKey} 的响应`);
+        if (!responses[matchedKey]) responses[matchedKey] = [];
+        responses[matchedKey].push({ timestamp: Date.now(), response: hexData });
+      });
 
-    // 等待 UDP_TIMEOUT 毫秒后关闭 socket，并返回收集到的响应数据
-    setTimeout(() => {
-      socket.close();
-      console.log('UDP请求结束，关闭 socket');
-      resolve(responses);
-    }, UDP_TIMEOUT);
+      socket.on('error', (err) => {
+        console.error(`Socket错误: ${err.message}`);
+      });
+
+      setTimeout(() => {
+        socket.close();
+        console.log('UDP请求结束');
+        resolve(responses);
+      }, UDP_TIMEOUT);
+    });
   });
 }
 
-// ---------------------- 增强型数据解析函数 ----------------------
-// 对相同 key 的响应归组，然后保留最后一条作为最终结果，同时附带所有响应记录
-async function processEnhancedData(inputData) {
-  const groupedResults = {};
-  // 将同一服务器的响应归为一组
-  for (const key of Object.keys(inputData)) {
-    // 如果存在多个响应，按时间戳排序，最后一条为最终结果
-    const responsesArr = inputData[key].sort((a, b) => a.timestamp - b.timestamp);
-    groupedResults[key] = {
-      final: responsesArr[responsesArr.length - 1],
-      all_responses: responsesArr
-    };
-  }
+// ---------------------- 数据解析 ----------------------
 
-  const results = {};
-  // 对每组取最终结果解析
-  for (const [address, group] of Object.entries(groupedResults)) {
-    const serverData = group.final;
-    try {
-      // 分离域名与端口
-      const [domain, port] = address.split(':');
-      const showPort = port && parseInt(port) !== config.defaultPort;
-      // 时间戳验证
-      const timestamp = validateTimestamp(serverData.timestamp);
-      // 解析 16 进制数据（增强容错）
-      const parsedData = parseHexPayload(serverData.response);
-      // 分离名称和简介
-      const [namePart, ...descParts] = parsedData.split(config.nameDescSeparator);
-      const serverName = processColorTags((namePart || '未知服务器').trim());
-      const description = processColorTags(descParts.join(config.nameDescSeparator).trim());
-      // 生成键名：若端口为默认则只用域名，否则保留 ip:port
-      results[showPort ? address : domain] = {
-        name: serverName,
-        description: description || '暂无描述',
-        last_updated: formatTimestamp(timestamp),
-        raw_hex: serverData.response,
-        all_responses: group.all_responses // 附带所有响应记录
-      };
-    } catch (err) {
-      results[address] = {
-        name: '数据解析失败',
-        description: `错误详情: ${err.message}`,
-        last_updated: new Date().toLocaleString(config.dateLocale),
-        raw_hex: serverData.response,
-        all_responses: group.all_responses
-      };
-    }
-  }
-  return results;
-}
 
-// 16 进制数据解析函数
-function parseHexPayload(hexString) {
-  try {
-    if (!/^[0-9a-fA-F]+$/.test(hexString)) {
-      throw new Error('包含非16进制字符');
-    }
-    const buffer = Buffer.from(hexString, 'hex');
-    return buffer.toString('utf8')
-      .replace(/[\x00-\x1F\x7F-\x9F]/g, '') // 清除控制字符
-      .replace(/\s+/g, ' ')
-      .trim();
-  } catch (err) {
-    throw new Error(`HEX解析失败: ${err.message}`);
-  }
-}
-
-// 时间戳验证
-function validateTimestamp(ts) {
-  if (typeof ts !== 'number' || ts < 0) {
-    console.warn(`无效时间戳: ${ts}, 使用当前时间替代`);
-    return Date.now();
-  }
-  return ts;
-}
-
-// 时间格式化
-function formatTimestamp(ts) {
-  try {
-    return new Date(ts).toLocaleString(config.dateLocale, {
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    });
-  } catch {
-    return new Date().toLocaleString(config.dateLocale);
-  }
-}
-
-// 颜色标签处理
 function processColorTags(text) {
   return text.replace(config.colorTagRegex, '{$1}');
 }
 
-// ---------------------- 解析 IP 数据并生成文件 ----------------------
-// 此部分对每个响应生成单独的 JSON 文件，并在文件中增加一个更新时间字段
-async function processIPResponses(responses) {
-  // 将 responses 对象转换为数组，每个元素包含 ip、port 和 data（16进制字符串）
-  const logs = [];
-  for (const key of Object.keys(responses)) {
-    // 对于同一 key 可能有多个响应，只取最后一个
-    const [ip, port] = key.split(':');
-    const arr = responses[key];
-    const finalResponse = arr.sort((a, b) => a.timestamp - b.timestamp)[arr.length - 1];
-    logs.push({ ip, port, data: finalResponse.response });
+function parseServerInfo(hexString) {
+  let local_name = '未知服务器', local_description = '未知', local_players = '未知', local_map = '未知地图';
+
+  const buf = Buffer.from(hexString, 'hex')
+
+  let str = "0";
+  str = buf.toString('utf-8');
+
+  const nameLenth = buf.readUInt8(0);
+  const mapLenth = buf.readUInt8(nameLenth + 1);
+  const subHex = buf.slice(nameLenth + 1 + mapLenth + 1, 12);
+  const officalLenth = buf.readUInt8(nameLenth + 1 + mapLenth + 1 + 12);
+  const sub2Hex = buf.slice(nameLenth + 1 + mapLenth + 1 + 12 + officalLenth + 1, 6);
+  const descriptionLenth = buf.readInt8(nameLenth + 1 + mapLenth + 1 + 12 + officalLenth + 1 - 1 + 6);
+  const sub3Hex = buf.slice(nameLenth + 1 + mapLenth + 1 + 12 + officalLenth + 1 + 6 + descriptionLenth + 1 - 1, 3);
+
+  local_name = buf.toString('utf-8', 1, nameLenth - 1).replace("[]", " ");
+  local_map = buf.toString('utf-8', nameLenth + 2, nameLenth + 2 + mapLenth).replace("[]", " ");
+  local_players = buf.readUint8(nameLenth + 2 + mapLenth + 1 + 2);
+  local_description = buf.toString('utf-8', nameLenth + 1 + mapLenth + 1 + 12 + officalLenth + 1 - 1 + 6 + 1,  nameLenth + 1 + mapLenth + 1 + 12 + officalLenth + 1 - 1 + 6 + 1 + descriptionLenth).replace("[]", " ");
+
+  
+/*
+  const playersMatch = parsed.match(/(\d+)\s*\/\s*(\d+)/);
+  if (playersMatch) players = `${playersMatch[1]}/${playersMatch[2]}`;
+
+  const mapMatch = parsed.match(/(?:地图|map)[:：]\s*([^\s\]]+)/i);
+  if (mapMatch) map = mapMatch[1];
+
+  const nameEndIndex = parsed.indexOf('[');
+  if (nameEndIndex > 0) {
+    name = parsed.substring(0, nameEndIndex).trim();
+    description = parsed.substring(nameEndIndex);
   }
 
-  // 检查并创建 output 文件夹（存放每个 IP 的解析结果）
-  const outputFolder = path.join(__dirname, 'output');
-  if (!fs.existsSync(outputFolder)) {
-    fs.mkdirSync(outputFolder, { recursive: true });
-    console.log('文件夹已创建：', outputFolder);
-  } else {
-    console.log('文件夹已存在：', outputFolder);
-  }
+  const specialTags = [
+    { regex: /\[gold\]/g, replace: '{gold}' },
+    { regex: /\[acid\]/g, replace: '{acid}' },
+    { regex: /\[sky\]/g, replace: '{sky}' },
+    { regex: /\[white\]/g, replace: '{white}' },
+    { regex: /\[tan\]/g, replace: '{tan}' },
+    { regex: /\[red\]/g, replace: '{red}' },
+    { regex: /\[yellow\]/g, replace: '{yellow}' },
+    { regex: /\[lime\]/g, replace: '{lime}' },
+    { regex: /\[stat\]/g, replace: '{stat}' }
+  ];
 
-  const serveIpData = [];
-
-  logs.forEach((log) => {
-    try {
-      // 将 16 进制字符串转换为 Buffer
-      const msg = Buffer.from(log.data, 'hex');
-
-      // 解析 IP 头部（Buffer.slice 返回 Buffer，需要转换为数组后 join）
-      const ipHeader = {
-        version: (msg[0] >> 4),
-        headerLength: (msg[0] & 0x0F) * 4,
-        totalLength: msg.readUInt16BE(2),
-        ttl: msg[8],
-        protocol: msg[9],
-        sourceIP: Array.from(msg.slice(12, 16)).join('.'),
-        destIP: Array.from(msg.slice(16, 20)).join('.')
-      };
-
-      // 解析 UDP 头部
-      const udpHeaderOffset = ipHeader.headerLength;
-      const udpHeader = {
-        sourcePort: msg.readUInt16BE(udpHeaderOffset),
-        destPort: msg.readUInt16BE(udpHeaderOffset + 2),
-        length: msg.readUInt16BE(udpHeaderOffset + 4)
-      };
-
-      // 提取 Mindustry 数据部分
-      const dataOffset = udpHeaderOffset + 8;
-      const rawData = msg.slice(dataOffset);
-      const messageText = rawData.toString('utf8');
-
-      // 正则提取服务器简介
-      const descriptionMatch = messageText.match(/\[gold\](.*?)\[acid\](.*?)(?=\u0000|$)/);
-      const serverDescription = descriptionMatch
-        ? (descriptionMatch[1].trim() + descriptionMatch[2].trim())
-        : "未找到服务器简介";
-
-      // 构造解析后的 JSON 数据，并增加更新时间字段
-      const parsedData = {
-        ipHeader,
-        udpHeader,
-        mindustryMessage: messageText,
-        serverDescription,
-        update_time: formatTimestamp(Date.now())
-      };
-
-      // 保存为每个 IP 对应的 JSON 文件（文件名：IP 中的点替换为破折号）
-      const ipFileName = log.ip.replace(/\./g, '-') + '.json';
-      const ipFilePath = path.join(outputFolder, ipFileName);
-      fs.writeFileSync(ipFilePath, JSON.stringify(parsedData, null, 4), 'utf8');
-      console.log(`Parsing complete. Results saved to ${ipFilePath}`);
-
-      // 记录 serveIp 数据
-      serveIpData.push({
-        ip: log.ip,
-        port: log.port,
-        description: serverDescription
-      });
-    } catch (err) {
-      console.error(`处理 ${log.ip}:${log.port} 时出错: ${err.message}`);
-    }
+  specialTags.forEach(tag => {
+    description = description.replace(tag.regex, tag.replace);
   });
 
-  // 保存所有 IP 数据到 serveip.json
-  const serveIpFilePath = path.join(__dirname, 'serveip.json');
-  fs.writeFileSync(serveIpFilePath, JSON.stringify(serveIpData, null, 4), 'utf8');
-  console.log(`All IP information saved to ${serveIpFilePath}`);
+  description = description.replace(/\s{2,}/g, ' ').trim();
+*/
+  return {
+    name: processColorTags(local_name),
+    description: processColorTags(local_description),
+    players: local_players,
+    map: processColorTags(local_map)
+  };
 }
 
-// ---------------------- 主流程 ----------------------
+// ---------------------- 整合处理+Ping ----------------------
+async function processEnhancedData(inputData) {
+  const servers = [];
+
+  for (const [address, responses] of Object.entries(inputData)) {
+    try {
+      const latest = responses.sort((a, b) => b.timestamp - a.timestamp)[0];
+      //const rawText = parseHexPayload(latest.response);
+      const { name, description, players, map } = parseServerInfo(latest.response);
+
+      const [host, port] = address.split(':');
+      const displayAddress = port && parseInt(port) !== config.defaultPort ? `${host}:${port}` : host;
+
+      // Ping 测试
+      let pingResult = '未知';
+      try {
+        const res = await ping.promise.probe(host, { timeout: 2 });
+        pingResult = res.alive ? `${res.time}ms` : '超时';
+      } catch {
+        pingResult = '错误';
+      }
+
+      servers.push({
+        ip: displayAddress,
+        name,
+        players,
+        map,
+        description,
+        ping: pingResult,
+        updatedAt: new Date(latest.timestamp).toLocaleString(config.dateLocale, {
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit'
+        }).replace(/\//g, '-'),
+        sentPackets: responses.length,
+        receivedMeta: latest.response.length / 2
+      });
+
+    } catch (err) {
+      console.error(`处理 ${address} 时出错: ${err.message}`);
+      servers.push({
+        ip: address,
+        name: '数据解析失败',
+        players: '未知',
+        map: '未知地图',
+        description: '解析失败',
+        ping: "未知",
+        updatedAt: new Date().toLocaleString(config.dateLocale),
+        sentPackets: 0,
+        receivedMeta: 0
+      });
+    }
+  }
+
+  return { servers };
+}
+
+// ---------------------- 主逻辑 ----------------------
 async function main() {
   try {
-    // 发送 UDP 请求并收集响应（所有响应以数组形式保存，便于保留最后一次及所有结果）
-    const responses = await sendUDPRequests();
+    let servers = [];
 
-    // 1. 将未解析的原始响应数据写入 output.json
-    await fsPromises.writeFile(RAW_FILE, JSON.stringify(responses, null, 2), 'utf8');
-    console.log(`未解析的原始数据已写入 ${RAW_FILE}`);
+    try {
+      servers = await loadServers();
+      console.log(`从本地加载了 ${servers.length} 个服务器`);
+    } catch {
+      console.log('本地服务器列表不可用，尝试下载...');
+    }
 
-    // 2. 对响应数据进行增强处理（保留每组的最后一条响应，同时附带所有响应），写入 responses.json
-    const processedData = await processEnhancedData(responses);
-    await fsPromises.writeFile(PARSED_FILE, JSON.stringify(processedData, null, 2), 'utf8');
-    console.log(`解析后的数据已写入 ${PARSED_FILE}`);
+    if (servers.length === 0) {
+      try {
+        console.log('下载服务器列表文件...');
+        await downloadServerList();
+        servers = await loadServers();
+        if (servers.length === 0) throw new Error('下载后仍为空');
+        console.log(`下载成功，加载了 ${servers.length} 个服务器`);
+      } catch (err) {
+        console.error('无法获取有效服务器列表，已终止任务: ', err.message);
+        return;
+      }
+    }
 
-    // 3. 解析 IP 数据，生成 individual JSON 文件，并生成无响应服务器列表（serveip.json）
-    await processIPResponses(responses);
+    const responses = await sendUDPRequests(servers);
+    await fs.promises.writeFile(RAW_FILE, JSON.stringify(responses, null, 2));
+    console.log(`原始响应数据已保存: ${RAW_FILE}`);
 
-    // 4. 计算无响应的服务器列表：对比配置文件中所有服务器与实际收到响应的服务器
-    const servers = await loadServers();
-    // 此处采用每个地址构成的 key 进行判断（注意：在 sendUDPRequests 中，每个 key 为 "ip:port"）
-    const responseKeys = new Set(Object.keys(responses));
-    const noResponseServers = servers.filter(server => {
-      const key = `${server.ip}:${server.port}`;
-      return !responseKeys.has(key);
-    });
-    await fsPromises.writeFile(NO_RESPONSE_FILE, JSON.stringify(noResponseServers, null, 2), 'utf8');
-    console.log(`无响应的服务器信息已写入 ${NO_RESPONSE_FILE}`);
+    const parsedData = await processEnhancedData(responses);
+    await fs.promises.writeFile(PARSED_FILE, JSON.stringify(parsedData, null, 2));
+    console.log(`解析后的服务器数据已保存: ${PARSED_FILE}`);
+    console.log(`共发现 ${parsedData.servers.length} 个服务器`);
 
   } catch (err) {
-    console.error('全局错误:', err);
+    console.error('全局错误:', err.message);
   }
 }
 
-// 定时执行（每30秒执行一次）
-setInterval(main, UDP_TIMEOUT);
-main(); // 立即执行一次
+
+// ---------------------- 替换符号 ----------------------
+function fixBrackets() {
+  const filePath = path.join(__dirname, 'servers.json');
+
+  let json;
+  try {
+    json = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch (e) {
+    console.error(' 读取 JSON 失败:', e.message);
+    return;
+  }
+
+  if (json.servers && Array.isArray(json.servers)) {
+    json.servers = json.servers.map(server => {
+      if (typeof server.name === 'string') {
+        server.name = server.name.replace(/\[([#0-9A-Fa-f]+)\]/g, '{$1}');
+      }
+      if (typeof server.description === 'string') {
+        server.description = server.description.replace(/\[([#0-9A-Fa-f]+)\]/g, '{$1}');
+      }
+      return server;
+    });
+
+    fs.writeFileSync(filePath, JSON.stringify(json, null, 2), 'utf8');
+    console.log('✨ 后置处理完成：已替换 name/description 中的 [ ] → { }');
+  }
+}
+
+// ---------------------- 执行 ----------------------
+async function run() {
+  await main(); // 等主程序执行完
+  fixBrackets(); // 然后执行后置处理
+  setInterval(async () => {
+    await main();
+    fixBrackets();
+  }, 5 * 60 * 1000); // 每 5 分钟循环
+}
+
+run(); 
+
+
+//console.log(parseServerInfo('4aef9dbd5b236666326130305de6a2a65b236234316530305de9ad945b233738313430305de79fad5b233530306430305de7a5b75b5def9dbd5b77686974655d20e4b8bbe69c8d20eea1a1205be59b9ee6a1a3315d5b6f72616e67655de587a0e68a8ae78cabe5a194e998b200000012000000ba00000096086f6666696369616c00000000004a5b676f6c645de69a91e58187e6b4bbe58aa8e5bc80e590afefbc815b6f72616e67655de88eb7e58f96e6b4bbe58aa8e8b4a7e5b881e8a7a3e99481e8a5bfe7939ce5aea0e789a9efbc810019a7'));
