@@ -33,26 +33,40 @@ const path = require('path');
 const ping = require('ping');
 const { Buffer } = require('buffer');
 
-// ---------------------- 配置 ----------------------
+// ---------------------- 配置  下载服务器列表镜像
 const SERVER_LIST_URLS = [
   'https://raw.githubusercontent.com/Anuken/Mindustry/master/servers_v7.json',
   'https://cdn.staticaly.com/gh/Anuken/Mindustry/master/servers_v7.json',
   'https://github.moeyy.xyz/https://github.com/Anuken/Mindustry/blob/master/servers_v7.json'
 ];
 
-const SERVER_LIST_PATH = path.join(__dirname, 'servers_v7.json');
-const RAW_FILE = path.join(__dirname, 'raw_responses.json');
-const PARSED_FILE = path.join(__dirname, 'servers.json');
-const CLIENT_PORT = 65415;
-const REQUEST_DATA = Buffer.from([0xFE, 0x01]);
+// ---------------------- 配置 ----------------------
+const SERVER_LIST_PATH = path.join(__dirname, 'servers_v7.json'); // 默认下载列表
+//const CUSTOM_SERVER_FILE = path.join(__dirname, 'customip.json'); // 自定义服务器列表 或许后面我会用吧
+const RAW_FILE = path.join(__dirname, 'raw_responses.json'); // 元数据
+const PARSED_FILE = path.join(__dirname, 'servers.json'); //  解析后的
+const CLIENT_PORT = 65415; // 绑定的端口
+const REQUEST_DATA = Buffer.from([0xFE, 0x01]); //构建包内容 二进制 发送一个 UDP 查询服务器状态
 const UDP_TIMEOUT = 30000;
 
 const config = {
-  defaultPort: 6567,
+  defaultPort: 6567, //默认发送端目标端口  : josn不使用默认
   colorTagRegex: /\[([a-z0-9#]+)\]/g,
   nameDescSeparator: '|',
   dateLocale: 'zh-CN'
 };
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 // ---------------------- 下载服务器列表 ----------------------
@@ -299,6 +313,14 @@ async function processEnhancedData(inputData) {
   return { servers };
 }
 
+
+
+
+
+
+
+
+
 // ---------------------- 主逻辑 ----------------------
 async function main() {
   try {
@@ -309,6 +331,15 @@ async function main() {
       console.log(`从本地加载了 ${servers.length} 个服务器`);
     } catch {
       console.log('本地服务器列表不可用，尝试下载...');
+    }
+
+    // ✅ 加载自定义服务器
+    try {
+      const customServers = await loadCustomServers(CUSTOM_SERVER_FILE);
+      servers = [...servers, ...customServers];
+      console.log(`已加载 ${customServers.length} 个自定义服务器`);
+    } catch (err) {
+      console.warn('加载自定义服务器失败:', err.message);
     }
 
     if (servers.length === 0) {
@@ -337,6 +368,14 @@ async function main() {
     console.error('全局错误:', err.message);
   }
 }
+
+
+
+
+
+
+
+
 
 
 // ---------------------- 替换符号 ----------------------
@@ -369,13 +408,141 @@ function fixBrackets() {
 
 // ---------------------- 执行 ----------------------
 async function run() {
-  await main(); // 等主程序执行完
-  fixBrackets(); // 然后执行后置处理
+  await main();            // 等主程序执行完
+  fixBrackets();           // 然后执行后置处理
+  await addServerIDs();    // ✅ 必须加这行！
+
   setInterval(async () => {
     await main();
     fixBrackets();
-  }, 5 * 60 * 1000); // 每 5 分钟循环
+    await addServerIDs();  // ✅ 每轮也要加
+  }, 5 * 60 * 1000);
 }
+
+
+
+
+
+// 打分Scoring 与ID分配  idplayers
+      
+async function addServerIDs() {
+  const filePath = path.join(__dirname, 'servers.json');
+  if (!fs.existsSync(filePath)) {
+    console.warn('⚠️ 未找到 servers.json，跳过 ID 处理');
+    return;
+  }
+
+  try {
+    const json = JSON.parse(await fs.promises.readFile(filePath, 'utf8'));
+    if (!json.servers || !Array.isArray(json.servers)) {
+      console.warn('⚠️ servers.json 格式不正确');
+      return;
+    }
+
+    const servers = json.servers;
+    let topServers = [];
+    let normalServers = [];
+
+    // 分离置顶服
+    for (const s of servers) {
+      if (typeof s.name === 'string' && /^100-\d+/.test(s.name)) {
+        topServers.push(s);
+      } else {
+        normalServers.push(s);
+      }
+    }
+
+    const ranked = [];
+    const bottom = [];
+
+    for (const s of normalServers) {
+      let players = 0;
+      let ping = 9999;
+      let invalid = false;
+
+      // 解析玩家人数
+      if (typeof s.players === 'number') {
+        players = s.players;
+      } else if (typeof s.players === 'string') {
+        const num = parseInt(s.players);
+        if (!isNaN(num)) players = num;
+        else invalid = true;
+      } else invalid = true;
+
+      // 解析延迟
+      if (typeof s.ping === 'string') {
+        if (s.ping.includes('超时') || s.ping.includes('未知')) invalid = true;
+        const ms = parseInt(s.ping.replace('ms', '').trim());
+        if (!isNaN(ms)) ping = ms;
+      } else if (typeof s.ping === 'number') {
+        ping = s.ping;
+      }
+
+      // 打分逻辑
+      let score = 0;
+
+      if (invalid) {
+        score = -999999;
+      } else {
+        // 基础分：每个玩家 +5 分
+        score += players * 5;
+
+        // 人数奖励
+        if (players >= 100) score += 2000;
+        else if (players >= 50) score += 800;
+        else if (players >= 20) score += 100;
+        else if (players >= 10) score += 40;
+        else if (players >= 5) score += 15;
+        else if (players >= 3) score += 5;
+        else if (players >= 1) score += 1;
+
+        // 延迟惩罚与奖励
+        if (ping > 500) score -= 400;
+        else if (ping > 400) score -= 330;
+        else if (ping > 300) score -= 150;
+        else if (ping > 200) score -= 80;
+        else if (ping > 150) score -= 40;
+        else if (ping < 40) score += 20;
+        else if (ping < 30) score += 40;
+        else if (ping < 50) score += 10;
+        else if (ping < 80) score += 5;
+      }
+
+      // 保存分数到 Scoring 字段
+      s.Scoring = score;
+
+      if (invalid) bottom.push(s);
+      else ranked.push(s);
+    }
+
+    // 排序：得分高的在前
+    ranked.sort((a, b) => b.Scoring - a.Scoring);
+    bottom.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+    // 重新分配 idplayers
+    let idCounter = 1000;
+    for (const s of [...ranked, ...bottom]) {
+      s.idplayers = idCounter++;
+    }
+
+    // 置顶服保持前列顺序
+    topServers.sort((a, b) => {
+      const aNum = parseInt(a.name.match(/^100-(\d+)/)?.[1] || 0);
+      const bNum = parseInt(b.name.match(/^100-(\d+)/)?.[1] || 0);
+      return aNum - bNum;
+    });
+
+    json.servers = [...topServers, ...ranked, ...bottom];
+
+    await fs.promises.writeFile(filePath, JSON.stringify(json, null, 2), 'utf8');
+    console.log(`✅ 已为 ${json.servers.length} 个服务器完成自动调优并分配 ID 和 Scoring`);
+  } catch (err) {
+    console.error('❌ 处理 idplayers 出错:', err.message);
+  }
+}
+
+
+
 
 run(); 
 
